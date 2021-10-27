@@ -5,9 +5,9 @@ import (
 	"encoding/xml"
 	"errors"
 	"io"
+	"net/url"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/go-pay/gopay/pkg/util"
 )
@@ -24,31 +24,22 @@ type xmlMapUnmarshal struct {
 	Value   string `xml:",cdata"`
 }
 
-var mu = new(sync.RWMutex)
-
 // 设置参数
 func (bm BodyMap) Set(key string, value interface{}) BodyMap {
-	mu.Lock()
 	bm[key] = value
-	mu.Unlock()
 	return bm
 }
 
 func (bm BodyMap) SetBodyMap(key string, value func(bm BodyMap)) BodyMap {
 	_bm := make(BodyMap)
 	value(_bm)
-
-	mu.Lock()
 	bm[key] = _bm
-	mu.Unlock()
 	return bm
 }
 
 // 设置 FormFile
 func (bm BodyMap) SetFormFile(key string, file *util.File) BodyMap {
-	mu.Lock()
 	bm[key] = file
-	mu.Unlock()
 	return bm
 }
 
@@ -62,8 +53,6 @@ func (bm BodyMap) GetString(key string) string {
 	if bm == nil {
 		return NULL
 	}
-	mu.RLock()
-	defer mu.RUnlock()
 	value, ok := bm[key]
 	if !ok {
 		return NULL
@@ -80,30 +69,22 @@ func (bm BodyMap) GetInterface(key string) interface{} {
 	if bm == nil {
 		return nil
 	}
-	mu.RLock()
-	defer mu.RUnlock()
 	return bm[key]
 }
 
 // 删除参数
 func (bm BodyMap) Remove(key string) {
-	mu.Lock()
 	delete(bm, key)
-	mu.Unlock()
 }
 
 // 置空BodyMap
 func (bm BodyMap) Reset() {
-	mu.Lock()
 	for k := range bm {
 		delete(bm, k)
 	}
-	mu.Unlock()
 }
 
 func (bm BodyMap) JsonBody() (jb string) {
-	mu.Lock()
-	defer mu.Unlock()
 	bs, err := json.Marshal(bm)
 	if err != nil {
 		return ""
@@ -142,18 +123,20 @@ func (bm *BodyMap) UnmarshalXML(d *xml.Decoder, start xml.StartElement) (err err
 	}
 }
 
+// Deprecated
 // ("bar=baz&foo=quux") sorted by key.
 func (bm BodyMap) EncodeWeChatSignParams(apiKey string) string {
+	if bm == nil {
+		return NULL
+	}
 	var (
 		buf     strings.Builder
 		keyList []string
 	)
-	mu.RLock()
 	for k := range bm {
 		keyList = append(keyList, k)
 	}
 	sort.Strings(keyList)
-	mu.RUnlock()
 	for _, k := range keyList {
 		if v := bm.GetString(k); v != NULL {
 			buf.WriteString(k)
@@ -170,16 +153,17 @@ func (bm BodyMap) EncodeWeChatSignParams(apiKey string) string {
 
 // ("bar=baz&foo=quux") sorted by key.
 func (bm BodyMap) EncodeAliPaySignParams() string {
+	if bm == nil {
+		return NULL
+	}
 	var (
 		buf     strings.Builder
 		keyList []string
 	)
-	mu.RLock()
 	for k := range bm {
 		keyList = append(keyList, k)
 	}
 	sort.Strings(keyList)
-	mu.RUnlock()
 	for _, k := range keyList {
 		if v := bm.GetString(k); v != NULL {
 			buf.WriteString(k)
@@ -194,16 +178,24 @@ func (bm BodyMap) EncodeAliPaySignParams() string {
 	return buf.String()[:buf.Len()-1]
 }
 
-// ("bar=baz&foo=quux")
-func (bm BodyMap) EncodeGetParams() string {
+// ("bar=baz&foo=quux") sorted by key.
+func (bm BodyMap) EncodeURLParams() string {
+	if bm == nil {
+		return NULL
+	}
 	var (
-		buf strings.Builder
+		buf  strings.Builder
+		keys []string
 	)
-	for k, _ := range bm {
+	for k := range bm {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
 		if v := bm.GetString(k); v != NULL {
-			buf.WriteString(k)
+			buf.WriteString(url.QueryEscape(k))
 			buf.WriteByte('=')
-			buf.WriteString(v)
+			buf.WriteString(url.QueryEscape(v))
 			buf.WriteByte('&')
 		}
 	}

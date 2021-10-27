@@ -6,20 +6,22 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
-	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
+	"github.com/go-pay/gopay"
 	"github.com/go-pay/gopay/pkg/aes"
 	"github.com/go-pay/gopay/pkg/errgroup"
 	"github.com/go-pay/gopay/pkg/util"
 	"github.com/go-pay/gopay/pkg/xhttp"
+	"github.com/go-pay/gopay/pkg/xlog"
+	"github.com/go-pay/gopay/pkg/xpem"
+	"github.com/go-pay/gopay/pkg/xtime"
 )
 
 // 获取微信平台证书公钥（获取后自行保存使用，如需定期刷新功能，自行实现）
@@ -29,32 +31,18 @@ import (
 //	  - 定期调用该接口，间隔时间小于12小时
 //	  - 加密请求消息中的敏感信息时，使用最新的平台证书（即：证书启用时间较晚的证书）
 //	文档说明：https://pay.weixin.qq.com/wiki/doc/apiv3/wechatpay/wechatpay5_1.shtml
-func GetPlatformCerts(mchid, apiV3Key, serialNo, pkContent string) (certs *PlatformCertRsp, err error) {
+func GetPlatformCerts(mchid, apiV3Key, serialNo, privateKey string) (certs *PlatformCertRsp, err error) {
 	var (
 		eg = new(errgroup.Group)
 		mu sync.Mutex
 		jb = ""
-		ok bool
-		pk *rsa.PrivateKey
 	)
 	// Prepare
-	block, _ := pem.Decode([]byte(pkContent))
-	if block == nil {
-		return nil, errors.New(fmt.Sprintf("pem.Decode(%s),error", pkContent))
-	}
-	pk8, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	priKey, err := xpem.DecodePrivateKey([]byte(privateKey))
 	if err != nil {
-		pk, err = x509.ParsePKCS1PrivateKey(block.Bytes)
-		if err != nil {
-			return nil, err
-		}
+		return nil, err
 	}
-	if pk == nil {
-		pk, ok = pk8.(*rsa.PrivateKey)
-		if !ok {
-			return nil, errors.New("parse PKCS8 key error")
-		}
-	}
+
 	timestamp := time.Now().Unix()
 	nonceStr := util.GetRandomString(32)
 	ts := util.Int642String(timestamp)
@@ -62,7 +50,7 @@ func GetPlatformCerts(mchid, apiV3Key, serialNo, pkContent string) (certs *Platf
 	// Sign
 	h := sha256.New()
 	h.Write([]byte(_str))
-	result, err := rsa.SignPKCS1v15(rand.Reader, pk, crypto.SHA256, h.Sum(nil))
+	result, err := rsa.SignPKCS1v15(rand.Reader, priKey, crypto.SHA256, h.Sum(nil))
 	if err != nil {
 		return nil, fmt.Errorf("rsa.SignPKCS1v15(),err:%+v", err)
 	}
@@ -73,19 +61,14 @@ func GetPlatformCerts(mchid, apiV3Key, serialNo, pkContent string) (certs *Platf
 	var url = v3BaseUrlCh + v3GetCerts
 	httpClient := xhttp.NewClient()
 	httpClient.Header.Add(HeaderAuthorization, authorization)
+	httpClient.Header.Add(HeaderRequestID, fmt.Sprintf("%s-%d", util.GetRandomString(21), time.Now().Unix()))
+	httpClient.Header.Add(HeaderSerial, serialNo)
 	httpClient.Header.Add("Accept", "*/*")
 	res, bs, errs := httpClient.Type(xhttp.TypeJSON).Get(url).EndBytes()
 	if len(errs) > 0 {
 		return nil, errs[0]
 	}
-	si := &SignInfo{
-		HeaderTimestamp: res.Header.Get(HeaderTimestamp),
-		HeaderNonce:     res.Header.Get(HeaderNonce),
-		HeaderSignature: res.Header.Get(HeaderSignature),
-		HeaderSerial:    res.Header.Get(HeaderSerial),
-		SignBody:        string(bs),
-	}
-	certs = &PlatformCertRsp{Code: Success, SignInfo: si}
+	certs = &PlatformCertRsp{Code: Success}
 	if res.StatusCode != http.StatusOK {
 		certs.Code = res.StatusCode
 		certs.Error = string(bs)
@@ -122,7 +105,6 @@ func GetPlatformCerts(mchid, apiV3Key, serialNo, pkContent string) (certs *Platf
 	if err = eg.Wait(); err != nil {
 		return nil, err
 	}
-
 	return certs, nil
 }
 
@@ -144,11 +126,11 @@ func (c *ClientV3) GetPlatformCerts() (certs *PlatformCertRsp, err error) {
 		return nil, err
 	}
 
-	res, si, bs, err := c.doProdGet(v3GetCerts, authorization)
+	res, _, bs, err := c.doProdGet(v3GetCerts, authorization)
 	if err != nil {
 		return nil, err
 	}
-	certs = &PlatformCertRsp{Code: Success, SignInfo: si}
+	certs = &PlatformCertRsp{Code: Success}
 	if res.StatusCode != http.StatusOK {
 		certs.Code = res.StatusCode
 		certs.Error = string(bs)
@@ -186,11 +168,18 @@ func (c *ClientV3) GetPlatformCerts() (certs *PlatformCertRsp, err error) {
 	return certs, nil
 }
 
+// Deprecated
 // 设置 微信支付平台证书 和 证书序列号
-//	注意：请预先通过 client.GetPlatformCerts() 获取 微信平台证书 和 证书序列号
+//	注意：请预先通过 client.GetPlatformCerts() 获取 微信平台公钥证书 和 证书序列号
 //	部分接口请求参数中敏感信息加密，使用此 微信支付平台公钥 和 证书序列号
-func (c *ClientV3) SetPlatformCert(wxPkContent []byte, wxSerialNo string) (client *ClientV3) {
-	c.wxPkContent = wxPkContent
+func (c *ClientV3) SetPlatformCert(wxPublicKeyContent []byte, wxSerialNo string) (client *ClientV3) {
+	pubKey, err := xpem.DecodePublicKey(wxPublicKeyContent)
+	if err != nil {
+		xlog.Errorf("SetPlatformCert(%s),err:%+v", wxPublicKeyContent, err)
+	}
+	if pubKey != nil {
+		c.wxPublicKey = pubKey
+	}
 	c.wxSerialNo = wxSerialNo
 	return c
 }
@@ -203,4 +192,78 @@ func (c *ClientV3) DecryptCerts(ciphertext, nonce, additional string) (wxCerts s
 		return "", fmt.Errorf("aes.GCMDecrypt, err:%+v", err)
 	}
 	return string(decrypt), nil
+}
+
+// 获取并选择最新的有效证书
+func (c *ClientV3) GetAndSelectNewestCert() (cert, serialNo string, err error) {
+	certs, err := c.GetPlatformCerts()
+	if err != nil {
+		return gopay.NULL, gopay.NULL, err
+	}
+	if certs.Code == Success && len(certs.Certs) > 0 {
+		// only one
+		if len(certs.Certs) == 1 {
+			formatExpire := xtime.FormatDateTime(certs.Certs[0].ExpireTime)
+			expireTime, err := time.ParseInLocation(xtime.TimeLayout, formatExpire, time.Local)
+			if err != nil {
+				return gopay.NULL, gopay.NULL, fmt.Errorf("time.ParseInLocation(%s, %s),err:%w", xtime.TimeLayout, formatExpire, err)
+			}
+			if time.Now().Unix() >= expireTime.Unix() {
+				// 过期了
+				return gopay.NULL, gopay.NULL, fmt.Errorf("wechat platform API cert expired, expired time: %s", formatExpire)
+			}
+			return certs.Certs[0].PublicKey, certs.Certs[0].SerialNo, nil
+		}
+		// more one
+		var (
+			effectiveTs []int
+			certMap     = make(map[int]*PlatformCertItem)
+		)
+		for _, v := range certs.Certs {
+			formatEffective := xtime.FormatDateTime(v.EffectiveTime)
+			effectiveTime, err := time.ParseInLocation(xtime.TimeLayout, formatEffective, time.Local)
+			if err != nil {
+				return gopay.NULL, gopay.NULL, fmt.Errorf("time.ParseInLocation(%s, %s),err:%w", xtime.TimeLayout, formatEffective, err)
+			}
+			eu := int(effectiveTime.Unix())
+			effectiveTs = append(effectiveTs, eu)
+			certMap[eu] = v
+		}
+		sort.Ints(effectiveTs)
+		// newest cert
+		newestCert := certMap[effectiveTs[len(effectiveTs)-1]]
+		formatExpire := xtime.FormatDateTime(newestCert.ExpireTime)
+		expireTime, err := time.ParseInLocation(xtime.TimeLayout, formatExpire, time.Local)
+		if err != nil {
+			return gopay.NULL, gopay.NULL, fmt.Errorf("time.ParseInLocation(%s, %s),err:%w", xtime.TimeLayout, formatExpire, err)
+		}
+		if time.Now().Unix() >= expireTime.Unix() {
+			// 过期了
+			return gopay.NULL, gopay.NULL, fmt.Errorf("wechat platform API cert expired, expired time: %s", formatExpire)
+		}
+		return newestCert.PublicKey, newestCert.SerialNo, nil
+	}
+	// failed
+	return gopay.NULL, gopay.NULL, fmt.Errorf("GetPlatformCerts() failed or certs is nil: %+v", certs)
+}
+
+func (c *ClientV3) autoCheckCertProc() {
+	for {
+		time.Sleep(time.Hour * 12)
+		wxPk, wxSerialNo, err := c.GetAndSelectNewestCert()
+		if err != nil {
+			xlog.Errorf("c.GetAndSelectNewestCert()，err:%+v", err)
+			err = nil
+			continue
+		}
+		// decode cert
+		pubKey, err := xpem.DecodePublicKey([]byte(wxPk))
+		if err != nil {
+			xlog.Errorf("xpem.DecodePublicKey(%s)，err:%+v", wxPk, err)
+			err = nil
+			continue
+		}
+		c.wxPublicKey = pubKey
+		c.wxSerialNo = wxSerialNo
+	}
 }

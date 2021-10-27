@@ -2,7 +2,6 @@ package wechat
 
 import (
 	"crypto/tls"
-	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -291,10 +290,9 @@ func (w *Client) doProdGet(bm gopay.BodyMap, path, signType string) (bs []byte, 
 	}
 
 	if w.DebugSwitch == gopay.DebugOn {
-		req, _ := json.Marshal(bm)
-		xlog.Debugf("Wechat_Request: %s", req)
+		xlog.Debugf("Wechat_Request: %s", bm.JsonBody())
 	}
-	param := bm.EncodeGetParams()
+	param := bm.EncodeURLParams()
 	url = url + "?" + param
 	res, bs, errs := xhttp.NewClient().Get(url).EndBytes()
 	if len(errs) > 0 {
